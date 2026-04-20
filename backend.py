@@ -6,35 +6,45 @@ import re
 
 from database import init_db, Appointment, get_db
 
-# =========================
-# INIT
-# =========================
 app = FastAPI()
 init_db()
 
-
 # =========================
-# PARSER (ROBUST VERSION)
+# SMART PARSER (STRONG + FLEXIBLE)
 # =========================
 def parse_datetime(text: str):
     text = (text or "").lower().strip()
     now = datetime.now()
 
+    # -------- HUMAN LANGUAGE HANDLING --------
+    if "evening" in text:
+        text += " 6pm"
+    if "morning" in text:
+        text += " 10am"
+    if "afternoon" in text:
+        text += " 2pm"
+    if "night" in text:
+        text += " 9pm"
+
     # -------- DATE --------
     if "tomorrow" in text:
         target_date = now.date() + timedelta(days=1)
+    elif "day after tomorrow" in text:
+        target_date = now.date() + timedelta(days=2)
     else:
         target_date = now.date()
 
-    # -------- CLEAN TEXT --------
+    # -------- CLEAN --------
     cleaned = text.replace(" ", "")
 
     # -------- TIME --------
     match = re.search(r"(\d{1,2})(?::(\d{2}))?(am|pm)", cleaned)
 
     if not match:
-        print("⚠️ Fallback time used for:", text)
-        return (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        # fallback safe slot (next hour rounded)
+        fallback = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        print("⚠️ Fallback used for:", text, "→", fallback)
+        return fallback
 
     hour = int(match.group(1))
     minute = int(match.group(2) or 0)
@@ -80,24 +90,23 @@ def root():
 
 @app.post("/schedule")
 def schedule(req: dict, db: Session = Depends(get_db)):
-    print("REQ RECEIVED:", req)
+    print("🔥 SCHEDULE REQ:", req)
 
-    dt_value = parse_datetime(req.get("natural_time", ""))
+    name = req.get("name", "").strip()
+    address = req.get("address", "").strip()
+    natural_time = req.get("natural_time", "")
 
-    # prevent duplicate slot booking
-    existing = db.execute(
-        select(Appointment).where(
-            Appointment.date_time == dt_value,
-            Appointment.canceled == False
-        )
-    ).scalars().first()
+    if not name or not natural_time:
+        raise HTTPException(400, "Missing required fields")
 
-    if existing:
+    dt_value = parse_datetime(natural_time)
+
+    if not is_available(db, dt_value):
         raise HTTPException(400, "Slot already booked")
 
     appt = Appointment(
-        name=req.get("name", "").strip(),
-        address=req.get("address", "").strip(),
+        name=name,
+        address=address,
         date_time=dt_value
     )
 
@@ -115,16 +124,20 @@ def schedule(req: dict, db: Session = Depends(get_db)):
 
 @app.post("/reschedule")
 def reschedule(req: dict, db: Session = Depends(get_db)):
-    print("REQ RECEIVED:", req)
-
-    old_dt = parse_datetime(req.get("old_time", ""))
-    new_dt = parse_datetime(req.get("new_time", ""))
+    print("🔁 RESCHEDULE REQ:", req)
 
     name = req.get("name", "").strip()
+    old_time = req.get("old_time", "")
+    new_time = req.get("new_time", "")
 
-    # time window ±2 min
-    start = old_dt - timedelta(minutes=2)
-    end = old_dt + timedelta(minutes=2)
+    if not name or not old_time or not new_time:
+        raise HTTPException(400, "Missing required fields")
+
+    old_dt = parse_datetime(old_time)
+    new_dt = parse_datetime(new_time)
+
+    start = old_dt - timedelta(minutes=3)
+    end = old_dt + timedelta(minutes=3)
 
     appt = db.execute(
         select(Appointment).where(
@@ -138,15 +151,7 @@ def reschedule(req: dict, db: Session = Depends(get_db)):
     if not appt:
         raise HTTPException(404, "Appointment not found")
 
-    # check new slot
-    existing = db.execute(
-        select(Appointment).where(
-            Appointment.date_time == new_dt,
-            Appointment.canceled == False
-        )
-    ).scalars().first()
-
-    if existing:
+    if not is_available(db, new_dt):
         raise HTTPException(400, "New slot already booked")
 
     appt.date_time = new_dt
@@ -159,30 +164,33 @@ def reschedule(req: dict, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/availability")
+def availability(date: str, db: Session = Depends(get_db)):
+    print("📊 AVAILABILITY REQ:", date)
+
+    base = parse_datetime(date)
+
+    slots = []
+    for hour in range(9, 21):  # 9AM → 9PM
+        slot = base.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+        if is_available(db, slot):
+            slots.append(str(slot))
+
+    return {"available_slots": slots}
+
+
 @app.get("/appointments")
 def get_all(db: Session = Depends(get_db)):
     result = db.execute(select(Appointment))
     return result.scalars().all()
 
 
-@app.get("/availability")
-def availability(date: str, db: Session = Depends(get_db)):
-    from datetime import datetime, timedelta
-
-    base = parse_datetime(date)
-
-    slots = []
-    for i in range(9, 18):  # 9am to 6pm
-        slot = base.replace(hour=i, minute=0)
-
-        exists = db.execute(
-            select(Appointment).where(
-                Appointment.date_time == slot,
-                Appointment.canceled == False
-            )
-        ).scalars().first()
-
-        if not exists:
-            slots.append(str(slot))
-
-    return {"available_slots": slots}
+# =========================
+# OPTIONAL: CLEAR DB (FOR TESTING)
+# =========================
+@app.delete("/clear-db")
+def clear_db(db: Session = Depends(get_db)):
+    db.query(Appointment).delete()
+    db.commit()
+    return {"status": "database cleared"}
